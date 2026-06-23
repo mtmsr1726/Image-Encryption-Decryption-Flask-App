@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+static/uploads/
+static/encrypted/
+static/decrypted/
