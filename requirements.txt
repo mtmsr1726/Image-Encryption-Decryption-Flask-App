@@ -4,3 +4,4 @@ opencv-python
 Werkzeug
 gunicorn
 psycopg2-binary
+supabase
