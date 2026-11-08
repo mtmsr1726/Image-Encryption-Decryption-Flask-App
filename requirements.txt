@@ -3,3 +3,4 @@ numpy
 opencv-python
 Werkzeug
 gunicorn
+psycopg2-binary
