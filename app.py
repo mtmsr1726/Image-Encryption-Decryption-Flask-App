@@ -1,19 +1,39 @@
-from flask import Flask, render_template, request, redirect, session
+from flask import (
+    Flask,
+    render_template,
+    request,
+    redirect,
+    session,
+    send_from_directory
+)
+
 from encryption import encrypt_image
 from decryption import decrypt_image
-from flask import send_from_directory
+from database import get_db_connection, init_db
+
 from werkzeug.utils import secure_filename
-import cv2
-import sqlite3
-import os
 from werkzeug.security import (
     generate_password_hash,
     check_password_hash
 )
+
+import cv2
+import os
+
 from datetime import datetime
+from psycopg2 import IntegrityError
+
+
+# =========================
+# FLASK CONFIGURATION
+# =========================
 
 app = Flask(__name__)
-app.secret_key = "secure_image_project"
+
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "development-secret-change-this"
+)
 
 UPLOAD_FOLDER = "static/uploads"
 ENCRYPTED_FOLDER = "static/encrypted"
@@ -25,54 +45,8 @@ os.makedirs(DECRYPTED_FOLDER, exist_ok=True)
 
 
 # =========================
-# DATABASE
+# DATABASE INITIALIZATION
 # =========================
-
-def init_db():
-
-    conn = sqlite3.connect("database.db")
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        email TEXT UNIQUE,
-        password TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS images(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender_username TEXT,
-        receiver_username TEXT,
-        filename TEXT,
-        secret_key TEXT,
-        upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS image_history(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            sender TEXT NOT NULL,
-
-            receiver TEXT NOT NULL,
-
-            encrypted_filename TEXT NOT NULL,
-
-            original_filename TEXT NOT NULL,
-
-            secret_key TEXT NOT NULL,
-
-            sent_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
 
 init_db()
 
@@ -87,34 +61,38 @@ def home():
     if "user" not in session:
         return redirect("/login")
 
-    conn = sqlite3.connect("database.db")
+    conn = get_db_connection()
 
-    sent_count = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM image_history
-        WHERE sender=?
-        """,
-        (session["user"],)
-    ).fetchone()[0]
+    try:
+        cur = conn.cursor()
 
-    received_count = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM image_history
-        WHERE receiver=?
-        """,
-        (session["user"],)
-    ).fetchone()[0]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM image_history
+            WHERE sender=%s
+            """,
+            (session["user"],)
+        )
+        sent_count = cur.fetchone()[0]
 
-    total_users = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM users
-        """
-    ).fetchone()[0]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM image_history
+            WHERE receiver=%s
+            """,
+            (session["user"],)
+        )
+        received_count = cur.fetchone()[0]
 
-    conn.close()
+        cur.execute(
+            "SELECT COUNT(*) FROM users"
+        )
+        total_users = cur.fetchone()[0]
+
+    finally:
+        conn.close()
 
     return render_template(
         "index.html",
@@ -123,6 +101,7 @@ def home():
         received_count=received_count,
         total_users=total_users
     )
+
 
 # =========================
 # REGISTER
@@ -137,7 +116,6 @@ def register():
         email = request.form["email"].strip()
         password = request.form["password"]
         confirm_password = request.form["confirm_password"]
-        hashed_password = generate_password_hash(password)
 
         if password != confirm_password:
             return render_template(
@@ -151,33 +129,36 @@ def register():
                 error="Please enter a valid Gmail address"
             )
 
-        conn = sqlite3.connect("database.db")
-        cur = conn.cursor()
+        hashed_password = generate_password_hash(password)
+
+        conn = get_db_connection()
 
         try:
+            cur = conn.cursor()
 
             cur.execute(
                 """
-                INSERT INTO users(username,email,password)
-                VALUES(?,?,?)
+                INSERT INTO users(username, email, password)
+                VALUES(%s, %s, %s)
                 """,
-                (username,email,hashed_password)
-                    
+                (username, email, hashed_password)
             )
 
             conn.commit()
-            conn.close()
 
             return redirect("/login")
 
-        except sqlite3.IntegrityError:
+        except IntegrityError:
 
-            conn.close()
+            conn.rollback()
 
             return render_template(
                 "register.html",
                 error="Username or Email already exists"
             )
+
+        finally:
+            conn.close()
 
     return render_template("register.html")
 
@@ -194,33 +175,35 @@ def login():
         email = request.form["email"]
         password = request.form["password"]
 
-        conn = sqlite3.connect("database.db")
-        cur = conn.cursor()
+        conn = get_db_connection()
 
-        cur.execute(
-            """
-            SELECT * FROM users
-            WHERE email=?
-            """,
-            (email,)
-        )
+        try:
+            cur = conn.cursor()
 
-        user = cur.fetchone()
+            cur.execute(
+                """
+                SELECT *
+                FROM users
+                WHERE email=%s
+                """,
+                (email,)
+            )
 
-        conn.close()
+            user = cur.fetchone()
 
-        if user and check_password_hash(user[3],password):
-   
-            session["user"] = user[1]
+        finally:
+            conn.close()
+
+        if user and check_password_hash(user["password"], password):
+
+            session["user"] = user["username"]
 
             return redirect("/")
 
-        else:
-
-            return render_template(
-                "login.html",
-                error="Invalid Email or Password"
-            )
+        return render_template(
+            "login.html",
+            error="Invalid Email or Password"
+        )
 
     return render_template("login.html")
 
@@ -246,47 +229,46 @@ def sender():
 
     if "user" not in session:
         return redirect("/login")
-    conn = sqlite3.connect("database.db")
-    cur = conn.cursor()
 
-    cur.execute("""
-        SELECT username
-        FROM users
-        WHERE username != ?
-        """,
-        (session["user"],)
-    )
+    conn = get_db_connection()
 
-    users = cur.fetchall()
+    try:
+        cur = conn.cursor()
 
-    conn.close()
+        cur.execute(
+            """
+            SELECT username
+            FROM users
+            WHERE username != %s
+            """,
+            (session["user"],)
+        )
+
+        users = cur.fetchall()
+
+    finally:
+        conn.close()
 
     if request.method == "POST":
 
         if "image" not in request.files:
             return render_template(
                 "sender.html",
+                users=users,
                 error="Please select an image"
             )
 
         image = request.files["image"]
 
         receiver = request.form["receiver_username"]
-
         secret_key = request.form["secret_key"]
 
-        allowed_extensions = {
-            "jpg",
-            "jpeg",
-            "png",
-            "bmp",
-            "tiff",
-            "webp"
-        }
+        allowed_extensions = {"png", "jpg", "jpeg"}
 
-        if "." not in image.filename:
+        if not image.filename or "." not in image.filename:
             return render_template(
                 "sender.html",
+                users=users,
                 error="Please select an image file"
             )
 
@@ -295,163 +277,148 @@ def sender():
         if ext not in allowed_extensions:
             return render_template(
                 "sender.html",
-                error="Unsupported image format"
-            )
-        # Check receiver exists
-        conn = sqlite3.connect("database.db")
-        cur = conn.cursor()
-
-        cur.execute(
-            "SELECT * FROM users WHERE username=?",
-            (receiver,)
-        )
-
-        user = cur.fetchone()
-
-        if not user:
-            conn.close()
-
-            return render_template(
-                "sender.html",
-                error="Receiver username not found"
-            )
-
-        # Check image extension
-        allowed_extensions = ["png", "jpg", "jpeg"]
-
-        ext = image.filename.rsplit(".", 1)[-1].lower()
-
-        if ext not in allowed_extensions:
-            conn.close()
-
-            return render_template(
-                "sender.html",
+                users=users,
                 error="Only PNG, JPG and JPEG images are allowed"
             )
 
-        # Safe filename
-        from werkzeug.utils import secure_filename
-
-        filename = secure_filename(image.filename)
-
-        original_filename = secure_filename(
-            image.filename
-        )
-
-        filepath = os.path.join(
-            UPLOAD_FOLDER,
-            original_filename
-        )
-
-        image.save(filepath)
-        encrypted = encrypt_image(
-            filepath,
-            secret_key
-        )
-
-        filename_without_ext = os.path.splitext(
-            original_filename
-        )[0]
-
-        encrypted_name = (
-            "enc_" +
-            filename_without_ext +
-            ".png"
-        )
-        encrypted_path = os.path.join(
-            ENCRYPTED_FOLDER,
-            encrypted_name
-        )
-
-        cv2.imwrite(
-            encrypted_path,
-            cv2.cvtColor(
-                encrypted,
-                cv2.COLOR_RGB2BGR
+        if not secret_key:
+            return render_template(
+                "sender.html",
+                users=users,
+                error="Please enter a secret key"
             )
-        )
 
-        cur.execute(
-            """
-            INSERT INTO images(
-                sender_username,
-                receiver_username,
-                filename,
+        conn = get_db_connection()
+
+        try:
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                SELECT username
+                FROM users
+                WHERE username=%s
+                """,
+                (receiver,)
+            )
+
+            user = cur.fetchone()
+
+            if not user:
+                return render_template(
+                    "sender.html",
+                    users=users,
+                    error="Receiver username not found"
+                )
+
+            original_filename = secure_filename(image.filename)
+
+            filepath = os.path.join(
+                UPLOAD_FOLDER,
+                original_filename
+            )
+
+            image.save(filepath)
+
+            encrypted = encrypt_image(
+                filepath,
                 secret_key
             )
-            VALUES(?,?,?,?)
-            """,
-            (
-                session["user"],
-                receiver,
-                encrypted_name,
-                secret_key
+
+            filename_without_ext = os.path.splitext(
+                original_filename
+            )[0]
+
+            encrypted_name = (
+                "enc_" +
+                filename_without_ext +
+                ".png"
             )
-        )
-        
-        current_user = session["user"]
 
-        sent_time = datetime.now().strftime(
-            "%d/%m/%Y %H:%M"
-        )
+            encrypted_path = os.path.join(
+                ENCRYPTED_FOLDER,
+                encrypted_name
+            )
 
-        conn.execute("""
-        INSERT INTO image_history
-        (
-        sender,
-        receiver,
-        encrypted_filename,
-        original_filename,
-        secret_key,
-        sent_time
-        )
-        VALUES (?,?,?,?,?,?)
-        """,
-        (
-            current_user,
-            receiver,
-            encrypted_name,
-            original_filename,
-            secret_key,
-            sent_time
-        ))
+            cv2.imwrite(
+                encrypted_path,
+                cv2.cvtColor(
+                    encrypted,
+                    cv2.COLOR_RGB2BGR
+                )
+            )
 
-        cur.execute("""
-        SELECT
-            sender,
-            receiver,
-            encrypted_filename,
-            sent_time
-        FROM image_history
-        ORDER BY id DESC
-        LIMIT 5
-        """)
+            cur.execute(
+                """
+                INSERT INTO images(
+                    sender_username,
+                    receiver_username,
+                    filename,
+                    secret_key
+                )
+                VALUES(%s, %s, %s, %s)
+                """,
+                (
+                    session["user"],
+                    receiver,
+                    encrypted_name,
+                    secret_key
+                )
+            )
 
-        print("\n===== IMAGE HISTORY =====")
+            current_user = session["user"]
 
-        for row in cur.fetchall():
-            print(row)
+            sent_time = datetime.now()
 
-        print("=========================\n")
+            cur.execute(
+                """
+                INSERT INTO image_history(
+                    sender,
+                    receiver,
+                    encrypted_filename,
+                    original_filename,
+                    secret_key,
+                    sent_time
+                )
+                VALUES(%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    current_user,
+                    receiver,
+                    encrypted_name,
+                    original_filename,
+                    secret_key,
+                    sent_time
+                )
+            )
 
-        cur.execute("SELECT * FROM image_history")
-        print("History Records:", cur.fetchall())
-        
+            conn.commit()
 
-        conn.commit()
-        conn.close()
+            return render_template(
+                "result.html",
+                message="Image Sent Successfully",
+                image_name=encrypted_name,
+                image_path="encrypted/" + encrypted_name
+            )
 
-        return render_template(
-            "result.html",
-            message="Image Sent Successfully",
-            image_name=encrypted_name,
-            image_path="encrypted/" + encrypted_name
-        )
-       
+        except Exception:
+            conn.rollback()
+            app.logger.exception("Image sending failed")
+            return render_template(
+                "sender.html",
+                users=users,
+                error="Unable to send image. Please try again."
+            )
+
+        finally:
+            conn.close()
+
     return render_template(
         "sender.html",
         users=users
     )
+
+
 # =========================
 # RECEIVER
 # =========================
@@ -462,64 +429,60 @@ def receiver():
     if "user" not in session:
         return redirect("/login")
 
-    conn = sqlite3.connect("database.db")
-    cur = conn.cursor()
+    conn = get_db_connection()
 
-    cur.execute(
-        """
-        SELECT
-            encrypted_filename,
-            sender,
-            sent_time
-        FROM image_history
-        WHERE receiver=?
-        ORDER BY id DESC
-        """,
-        (session["user"],)
-    )
-
-    images = cur.fetchall()
-
-    print("\n===== RECEIVER DATA =====")
-    print("Logged User:", session["user"])
-
-    for img in images:
-        print(img)
-
-    print("=========================\n")
-
-    conn.close()
-
-    if request.method == "POST":
-
-        image_name = request.form["image_name"]
-
-        secret_key = request.form["secret_key"]
-
-        conn = sqlite3.connect("database.db")
+    try:
         cur = conn.cursor()
 
         cur.execute(
             """
-            SELECT *
-            FROM images
-            WHERE filename=?
-            AND secret_key=?
-            AND receiver_username=?
+            SELECT
+                encrypted_filename,
+                sender,
+                sent_time
+            FROM image_history
+            WHERE receiver=%s
+            ORDER BY id DESC
             """,
-            (
-                image_name,
-                secret_key,
-                session["user"]
-            )
+            (session["user"],)
         )
 
-        data = cur.fetchone()
+        images = cur.fetchall()
 
+    finally:
         conn.close()
 
-        if not data:
+    if request.method == "POST":
 
+        image_name = request.form["image_name"]
+        secret_key = request.form["secret_key"]
+
+        conn = get_db_connection()
+
+        try:
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                SELECT *
+                FROM images
+                WHERE filename=%s
+                AND secret_key=%s
+                AND receiver_username=%s
+                """,
+                (
+                    image_name,
+                    secret_key,
+                    session["user"]
+                )
+            )
+
+            data = cur.fetchone()
+
+        finally:
+            conn.close()
+
+        if not data:
             return render_template(
                 "receiver.html",
                 images=images,
@@ -530,8 +493,13 @@ def receiver():
             ENCRYPTED_FOLDER,
             image_name
         )
-        print("Opening:", encrypted_path)
-        print("Exists:", os.path.exists(encrypted_path))
+
+        if not os.path.exists(encrypted_path):
+            return render_template(
+                "receiver.html",
+                images=images,
+                error="Encrypted image file not found"
+            )
 
         decrypted = decrypt_image(
             encrypted_path,
@@ -563,6 +531,7 @@ def receiver():
             image_name=output_name,
             image_path="decrypted/" + output_name
         )
+
     return render_template(
         "receiver.html",
         images=images
@@ -570,7 +539,7 @@ def receiver():
 
 
 # =========================
-# RUN
+# HISTORY
 # =========================
 
 @app.route("/history")
@@ -581,31 +550,38 @@ def history():
 
     search = request.args.get("search", "")
 
-    conn = sqlite3.connect("database.db")
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
 
-    history = conn.execute("""
-    SELECT *
-    FROM image_history
-    WHERE
-    (sender=? OR receiver=?)
-    AND
-    (
-        sender LIKE ?
-        OR receiver LIKE ?
-        OR original_filename LIKE ?
-    )
-    ORDER BY sent_time DESC
-    """,
-    (
-        session["user"],
-        session["user"],
-        f"%{search}%",
-        f"%{search}%",
-        f"%{search}%"
-    )).fetchall()
+    try:
+        cur = conn.cursor()
 
-    conn.close()
+        cur.execute(
+            """
+            SELECT *
+            FROM image_history
+            WHERE
+                (sender=%s OR receiver=%s)
+            AND
+                (
+                    sender LIKE %s
+                    OR receiver LIKE %s
+                    OR original_filename LIKE %s
+                )
+            ORDER BY sent_time DESC
+            """,
+            (
+                session["user"],
+                session["user"],
+                f"%{search}%",
+                f"%{search}%",
+                f"%{search}%"
+            )
+        )
+
+        history = cur.fetchall()
+
+    finally:
+        conn.close()
 
     return render_template(
         "history.html",
@@ -613,24 +589,43 @@ def history():
         search=search
     )
 
+
+# =========================
+# VIEW HISTORY
+# =========================
+
 @app.route("/view_history/<int:image_id>")
 def view_history(image_id):
 
     if "user" not in session:
         return redirect("/login")
 
-    conn = sqlite3.connect("database.db")
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
 
-    image = conn.execute(
-        "SELECT * FROM image_history WHERE id=?",
-        (image_id,)
-    ).fetchone()
+    try:
+        cur = conn.cursor()
 
-    conn.close()
+        cur.execute(
+            """
+            SELECT *
+            FROM image_history
+            WHERE id=%s
+            AND (sender=%s OR receiver=%s)
+            """,
+            (
+                image_id,
+                session["user"],
+                session["user"]
+            )
+        )
+
+        image = cur.fetchone()
+
+    finally:
+        conn.close()
 
     if image is None:
-        return "Image not found"
+        return "Image not found", 404
 
     if image["sender"] == session["user"]:
         return render_template(
@@ -641,39 +636,89 @@ def view_history(image_id):
     return render_template(
         "verify_key.html",
         image=image
-    )    
+    )
+
+
+# =========================
+# DECRYPT HISTORY
+# =========================
 
 @app.route(
-"/decrypt_history/<int:image_id>",
-methods=["POST"]
+    "/decrypt_history/<int:image_id>",
+    methods=["POST"]
 )
 def decrypt_history(image_id):
 
-    conn = sqlite3.connect("database.db")
-    conn.row_factory = sqlite3.Row
+    if "user" not in session:
+        return redirect("/login")
 
-    image = conn.execute(
-        """
-        SELECT *
-        FROM image_history
-        WHERE id=?
-        """,
-        (image_id,)
-    ).fetchone()
+    conn = get_db_connection()
 
-    conn.close()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT *
+            FROM image_history
+            WHERE id=%s
+            AND receiver=%s
+            """,
+            (image_id, session["user"])
+        )
+
+        image = cur.fetchone()
+
+    finally:
+        conn.close()
+
+    if image is None:
+        return "Image not found", 404
 
     entered_key = request.form["secret_key"]
 
     if entered_key != image["secret_key"]:
-
         return render_template(
             "verify_key.html",
             image=image,
             error="❌ Wrong Secret Key"
         )
 
-    decrypted_file = "dec_" + image["encrypted_filename"]
+    encrypted_path = os.path.join(
+        ENCRYPTED_FOLDER,
+        image["encrypted_filename"]
+    )
+
+    if not os.path.exists(encrypted_path):
+        return render_template(
+            "verify_key.html",
+            image=image,
+            error="Encrypted image file not found"
+        )
+
+    decrypted = decrypt_image(
+        encrypted_path,
+        entered_key
+    )
+
+    decrypted_file = (
+        "dec_" +
+        os.path.splitext(image["encrypted_filename"])[0] +
+        ".png"
+    )
+
+    output_path = os.path.join(
+        DECRYPTED_FOLDER,
+        decrypted_file
+    )
+
+    cv2.imwrite(
+        output_path,
+        cv2.cvtColor(
+            decrypted,
+            cv2.COLOR_RGB2BGR
+        )
+    )
 
     return render_template(
         "view_received.html",
@@ -681,43 +726,61 @@ def decrypt_history(image_id):
         decrypted_file=decrypted_file
     )
 
+
+# =========================
+# PROFILE
+# =========================
+
 @app.route("/profile")
 def profile():
 
     if "user" not in session:
         return redirect("/login")
 
-    conn = sqlite3.connect("database.db")
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
 
-    user = conn.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE username=?
-        """,
-        (session["user"],)
-    ).fetchone()
+    try:
+        cur = conn.cursor()
 
-    sent_count = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM image_history
-        WHERE sender=?
-        """,
-        (session["user"],)
-    ).fetchone()[0]
+        cur.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE username=%s
+            """,
+            (session["user"],)
+        )
 
-    received_count = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM image_history
-        WHERE receiver=?
-        """,
-        (session["user"],)
-    ).fetchone()[0]
+        user = cur.fetchone()
 
-    conn.close()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM image_history
+            WHERE sender=%s
+            """,
+            (session["user"],)
+        )
+
+        sent_count = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM image_history
+            WHERE receiver=%s
+            """,
+            (session["user"],)
+        )
+
+        received_count = cur.fetchone()[0]
+
+    finally:
+        conn.close()
+
+    if user is None:
+        session.clear()
+        return redirect("/login")
 
     return render_template(
         "profile.html",
@@ -727,26 +790,30 @@ def profile():
         received_count=received_count
     )
 
+
+# =========================
+# STATS
+# =========================
+
 @app.route("/stats")
 def stats():
 
-    conn = sqlite3.connect(
-        "database.db"
-    )
+    if "user" not in session:
+        return redirect("/login")
 
-    cur = conn.cursor()
+    conn = get_db_connection()
 
-    cur.execute(
-    "SELECT COUNT(*) FROM users"
-    )
-    users = cur.fetchone()[0]
+    try:
+        cur = conn.cursor()
 
-    cur.execute(
-    "SELECT COUNT(*) FROM images"
-    )
-    images = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users")
+        users = cur.fetchone()[0]
 
-    conn.close()
+        cur.execute("SELECT COUNT(*) FROM images")
+        images = cur.fetchone()[0]
+
+    finally:
+        conn.close()
 
     return render_template(
         "stats.html",
@@ -754,69 +821,109 @@ def stats():
         images=images
     )
 
+
+# =========================
+# DELETE HISTORY
+# =========================
+
 @app.route("/delete_history/<int:image_id>")
 def delete_history(image_id):
 
     if "user" not in session:
         return redirect("/login")
 
-    conn = sqlite3.connect("database.db")
+    conn = get_db_connection()
 
-    conn.execute(
-        """
-        DELETE FROM image_history
-        WHERE id=?
-        AND (
-            sender=?
-            OR receiver=?
-        )
-        """,
-        (
-            image_id,
-            session["user"],
-            session["user"]
-        )
-    )
+    try:
+        cur = conn.cursor()
 
-    conn.commit()
-    conn.close()
+        cur.execute(
+            """
+            DELETE FROM image_history
+            WHERE id=%s
+            AND (sender=%s OR receiver=%s)
+            """,
+            (
+                image_id,
+                session["user"],
+                session["user"]
+            )
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
 
     return redirect("/history")
 
+
+# =========================
+# FAVICON
+# =========================
+
+@app.route("/favicon.ico")
+def favicon():
+
+    return send_from_directory(
+        "static",
+        "favicon.ico",
+        mimetype="image/vnd.microsoft.icon"
+    )
+
+
+# =========================
+# CHECK HISTORY
+# =========================
+
+@app.route("/check_history")
+def check_history():
+
+    if "user" not in session:
+        return redirect("/login")
+
+    conn = get_db_connection()
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT *
+            FROM image_history
+            WHERE sender=%s OR receiver=%s
+            ORDER BY id DESC
+            """,
+            (session["user"], session["user"])
+        )
+
+        rows = cur.fetchall()
+
+    finally:
+        conn.close()
+
+    return str(rows)
+
+
+# =========================
+# ERROR HANDLERS
+# =========================
+
 @app.errorhandler(404)
 def page_not_found(error):
+
     return render_template("404.html"), 404
 
 
 @app.errorhandler(500)
 def internal_server_error(error):
+
     return render_template("500.html"), 500
 
-@app.route('/favicon.ico')
-def favicon():
-    return send_from_directory(
-        'static',
-        'favicon.ico',
-        mimetype='image/vnd.microsoft.icon'
-    )
 
-@app.route("/check_history")
-def check_history():
-
-    conn = sqlite3.connect("database.db")
-    cur = conn.cursor()
-
-    cur.execute("""
-    SELECT *
-    FROM image_history
-    ORDER BY id DESC
-    """)
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    return str(rows)
+# =========================
+# RUN
+# =========================
 
 if __name__ == "__main__":
     app.run(debug=True)
